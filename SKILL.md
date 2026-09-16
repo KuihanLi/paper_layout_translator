@@ -1,3 +1,8 @@
+---
+name: paper-layout-translator
+description: Translate born-digital academic PDF papers while preserving the original page count, columns, figures, equations, tables, backgrounds, captions, and overall geometry, without asking the user to configure an external LLM API. Use when a user uploads or links a scientific paper/PDF and asks for Chinese or another-language full-text translation, especially when they want a PDF2zh/BabelDOC-like layout-preserving result, coherent paragraph translation, or an optional bilingual PDF. The scripts perform deterministic local parsing/rendering while the active ChatGPT conversation or Work task itself performs translation, so no third-party translation API key, provider URL, or local LLM setup is required.
+---
+
 # Paper Layout Translator
 
 Use the V2 pipeline: **inspect -> reconstruct semantic paragraphs -> translate with the active ChatGPT model -> validate -> remove source glyphs only -> flow translated paragraphs through original regions -> render/QA**.
