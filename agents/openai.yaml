@@ -1,0 +1,13 @@
+interface:
+  display_name: Paper Layout Translator
+  short_description: Paragraph-aware academic PDF translation that preserves original
+    layout and backgrounds without external LLM API setup.
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
