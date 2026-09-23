@@ -2,35 +2,49 @@
 
 > [中文](README.md) | English
 
-Paper Layout Translator is an academic PDF translation Skill designed for ChatGPT / Work. Instead of extracting text and rebuilding the document from scratch, it translates **semantic paragraphs** and flows the translation back through the PDF's original text regions while preserving page count, columns, equations, figures, backgrounds, and page geometry as closely as practical.
+Paper Layout Translator is an academic PDF translation Skill for ChatGPT / Work. Instead of extracting text and rebuilding the document from scratch, it preserves the original page count, columns, equations, figures, backgrounds, and page geometry as closely as practical. V3.1 first establishes a **target-language layout contract before translation**, then translates semantic paragraphs and writes them back only after a pre-render fit gate passes.
 
-## What it does
+The current public engine is **Paper Layout Translator V3.1**.
+
+## What changed in V3.1
 
 ```text
 inspect source PDF
-  -> reconstruct semantic paragraphs / table cells / captions
+  -> reconstruct semantic units + source geometry
+  -> layout preflight
+       -> safe writable regions
+       -> image/figure exclusions
+       -> flow vs slots classification
+       -> CJK font/capacity budget
+       -> PASS before batches exist
   -> translate with the active ChatGPT session model
-  -> validate completeness and protected tokens
-  -> remove source glyphs only
-  -> flow translated paragraphs through original regions
-  -> structural QA + full-page visual inspection
+  -> validate completeness / protected tokens
+  -> pre-render fit gate with real translated text
+  -> text-only replacement only after PASS
+  -> structural QA + full-page visual QA
 ```
 
-Key capabilities:
+This makes text/figure overlap, wrap-around prose, narrow continuation regions, and target-language density primarily **pre-constrained layout problems**, not issues discovered only after a PDF has already been rendered.
+
+## Key capabilities
 
 - paragraph-first translation instead of PDF-line fragments;
-- preservation of page dimensions and multi-column structure;
-- display equations, images, vector graphics, page backgrounds, and annotations remain untouched by default;
-- source text is removed with text-only redaction rather than opaque white overlays;
-- one semantic paragraph can flow across multiple original regions, columns, or pages;
-- numbers, units, citations, model names, dataset names, and mathematical meaning are protected;
-- bibliographic entries are preserved by default;
+- pre-translation detection and freezing of safe target-language writable regions;
+- `flow` regions for regular prose and source-line `slots` for wrap-around / irregular prose;
+- hard protection for images, diagrams, matrices, vector graphics, equations, and backgrounds;
+- raster figure-internal text is preserved by default and translated only when explicitly requested;
+- per-unit `soft_cjk_chars` / `hard_cjk_chars` plus preferred/minimum font budgets;
+- CJK density-aware font/leading adaptation to reduce unnecessary whitespace;
+- pre-render fitting of actual translated text before the source PDF is mutated;
+- text-only redaction rather than opaque white overlays;
+- retained glyph IDs during CJK subsetting to avoid Identity-H rendering regressions;
+- final QA for geometry, preserved images, out-of-page text, CJK rendering, overflow, and collisions;
 - optional alternating or side-by-side bilingual PDFs;
-- no third-party LLM API is required: language translation is performed by the active ChatGPT / Work session.
+- no third-party LLM API: the active ChatGPT / Work session performs the linguistic translation.
 
 ## Upstream inspiration and attribution
 
-The project was originally motivated by studying layout-preserving academic PDF translation projects, especially:
+The project was motivated by studying layout-preserving academic PDF translation projects, especially:
 
 - **Zotero PDF2zh** — `guaguastandup/zotero-pdf2zh`  
   https://github.com/guaguastandup/zotero-pdf2zh
@@ -39,17 +53,14 @@ The project was originally motivated by studying layout-preserving academic PDF 
 - **BabelDOC** — `funstory-ai/BabelDOC`  
   https://github.com/funstory-ai/BabelDOC
 
-`zotero-pdf2zh` is a Zotero PDF translation plugin that integrates PDF2zh / PDF2zh_next for layout- and formula-preserving PDF translation. At the time this repository was published, that upstream repository is distributed under **AGPL-3.0**.
-
-Paper Layout Translator is **not an official fork of those projects and does not bundle or copy their implementation code**. It is an independent ChatGPT / Work Skill and deterministic local PDF-processing pipeline that follows several high-level design lessons: reconstruct semantic paragraphs before translation, protect math/graphics, preserve logical multi-column order, and render translation back into the original regions only after translation.
-
-See [`NOTICE.md`](NOTICE.md) and [`references/architecture.md`](references/architecture.md) for details.
+Paper Layout Translator is **not an official fork and does not bundle or copy their implementation code**. It is an independent ChatGPT / Work Skill and deterministic local PDF-processing pipeline that follows high-level lessons such as semantic reconstruction, math/graphics protection, and layout-preserving rendering. See [`NOTICE.md`](NOTICE.md) and [`references/architecture.md`](references/architecture.md).
 
 ## Repository layout
 
 ```text
 paper_layout_translator/
 ├── SKILL.md
+├── VERSION.md
 ├── README.md
 ├── README.en.md
 ├── NOTICE.md
@@ -61,14 +72,17 @@ paper_layout_translator/
 │   └── icon.svg
 ├── references/
 │   ├── architecture.md
+│   ├── layout_policy.md
 │   └── translation_policy.md
 └── scripts/
     ├── prepare.py
+    ├── layout_preflight.py
     ├── validate.py
     ├── apply.py
     ├── qa.py
     ├── render_preview.py
-    └── make_dual.py
+    ├── make_dual.py
+    └── self_test.py
 ```
 
 ## Quick workflow
@@ -79,17 +93,34 @@ Preview the source:
 python scripts/render_preview.py paper.pdf --outdir work/original_preview --pages auto --dpi 160 --contact-sheet
 ```
 
-Prepare paragraph-aware units:
+Reconstruct semantic units and raw geometry:
 
 ```bash
 python scripts/prepare.py paper.pdf --workdir work --lang-out zh-CN
 ```
 
-Translate the generated batches with the active ChatGPT / Work session and save translation files under `work/translated/`.
+`prepare.py` intentionally creates **no translation batches**.
+
+Run layout preflight:
+
+```bash
+python scripts/layout_preflight.py --workdir work
+```
+
+Only a `PASS` creates `units_planned.jsonl`, `layout_plan.json`, `layout_preflight.pdf`, and `batches/batch_XXX.json`.
+
+Preview the layout plan:
+
+```bash
+python scripts/render_preview.py work/layout_preflight.pdf --outdir work/layout_preflight_preview --pages auto --dpi 130 --contact-sheet
+```
+
+Translate the generated batches with the active ChatGPT / Work session, using each item's layout budget as a concision target without dropping scientific meaning.
 
 Validate:
 
 ```bash
+python scripts/validate.py --workdir work --strict --write-merged
 python scripts/validate.py --workdir work --strict --strict-tokens --write-merged
 ```
 
@@ -99,16 +130,24 @@ Apply translations:
 python scripts/apply.py paper.pdf --workdir work --output work/paper_translated.pdf
 ```
 
+Before modifying the source PDF, `apply.py` fits the real translation through the frozen layout. If it cannot fit safely, it writes a repair batch and exits without rendering a knowingly broken PDF.
+
 Run structural QA:
 
 ```bash
 python scripts/qa.py paper.pdf work/paper_translated.pdf --workdir work
 ```
 
-Render every translated page for visual inspection:
+Render every translated page:
 
 ```bash
 python scripts/render_preview.py work/paper_translated.pdf --outdir work/final_preview --pages all --dpi 130 --contact-sheet
+```
+
+Run deterministic regression tests after Skill changes:
+
+```bash
+python scripts/self_test.py
 ```
 
 Optional bilingual PDF:
@@ -129,8 +168,8 @@ The runtime also needs an installed CJK font such as Noto CJK or Source Han. Fon
 ## Current limitations
 
 - Best on born-digital PDFs with extractable text; scans usually require OCR first.
-- Rasterized text inside figures is left unchanged by default.
-- Highly irregular magazine layouts, rotated/vertical text, or deeply nested vector tables can require page-specific repairs.
+- Rasterized text inside figures is preserved by default rather than automatically translated.
+- Highly irregular magazine layouts, rotated/vertical text, or deeply nested vector tables can still require page-specific handling.
 - Exact proprietary source fonts are not guaranteed; the workflow preserves geometry and typographic scale using an available CJK-compatible font.
 - The local engine is intentionally lighter than BabelDOC; the active ChatGPT session remains the translator.
 

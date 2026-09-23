@@ -82,7 +82,7 @@ def main() -> int:
     if args.write_merged:
         (wd / "translations_merged.json").write_text(json.dumps(translations, ensure_ascii=False, indent=2), encoding="utf-8")
     report = {
-        "engine_version": 2,
+        "engine_version": 3.1,
         "expected": len(units),
         "translated": len(set(translations) & set(units)),
         "missing": len(missing),

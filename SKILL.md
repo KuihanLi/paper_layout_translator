@@ -1,172 +1,172 @@
 ---
 name: paper-layout-translator
-description: Translate born-digital academic PDF papers while preserving the original page count, columns, figures, equations, tables, backgrounds, captions, and overall geometry, without asking the user to configure an external LLM API. Use when a user uploads or links a scientific paper/PDF and asks for Chinese or another-language full-text translation, especially when they want a PDF2zh/BabelDOC-like layout-preserving result, coherent paragraph translation, or an optional bilingual PDF. The scripts perform deterministic local parsing/rendering while the active ChatGPT conversation or Work task itself performs translation, so no third-party translation API key, provider URL, or local LLM setup is required.
+description: Translate born-digital academic PDF papers while preserving page count, columns, figures, equations, tables, backgrounds, captions, and overall geometry. Use when a user wants a PDF2zh/BabelDOC-like full-text translation without configuring an external LLM API. The active ChatGPT/Work session performs paragraph translation; deterministic local scripts first build and validate safe target-language layout regions and capacity budgets, then render only after a pre-render fit gate passes.
 ---
 
 # Paper Layout Translator
 
-Use the V2 pipeline: **inspect -> reconstruct semantic paragraphs -> translate with the active ChatGPT model -> validate -> remove source glyphs only -> flow translated paragraphs through original regions -> render/QA**.
+**Build identity:** `V3.1.0`
+
+Use the V3.1 pipeline: **inspect -> reconstruct semantic units -> preflight final writable regions + CJK capacity -> translate against the approved layout budget -> validate -> pre-render fit gate -> text-only replacement -> structural QA -> full-page visual QA**.
 
 Never call an external LLM or machine-translation API from the bundled scripts.
 
-## Non-negotiable quality rules
+## Core rules
 
-- Translate paragraphs / semantic units, never individual PDF lines for ordinary prose.
-- Use the PDF's content-stream order (`sort=False`) so multi-column reading order is not reconstructed only from vertical coordinates.
-- Preserve display equations, figures, charts, vector graphics, page backgrounds, annotations, and page geometry.
-- Do not paint white rectangles over source text. V2 uses text-only redaction so original backgrounds and graphics survive.
-- Keep citations, numbers, units, model names, dataset names, and mathematical meaning intact.
-- Preserve bibliographic entries by default; translate the `References` heading but not each reference unless the user asks.
-- Complete the workflow autonomously in Work mode. Do not ask the user to configure API keys or manually translate JSON batches.
-- Read `references/translation_policy.md` before translating. Read `references/architecture.md` when explaining the design or limitations.
+- Translate coherent paragraphs / semantic units, never ordinary PDF lines one by one.
+- Treat semantic reconstruction and layout reconstruction as separate models.
+- **Finish layout planning before linguistic translation starts.** Post-render collision detection is only a final assertion, not the primary repair strategy.
+- Use PDF content-stream order (`sort=False`) for semantic order.
+- Preserve display equations, figures, charts, vector graphics, backgrounds, annotations, page count, and page geometry.
+- Preserve raster figure-internal text by default; translate it only when explicitly requested.
+- Remove source glyphs with text-only redaction; never paint white cover rectangles.
+- Preserve numbers, units, citations, models/datasets, formulas, and uncertainty.
+- Treat unsafe geometry, unresolved overflow, image/text collision, clipped text, and broken CJK glyphs as hard failures.
+- Keep `translation_run_log.json`, `layout_plan.json`, and QA reports when the result is being used to improve this Skill.
+- Read `references/translation_policy.md` before translation and `references/layout_policy.md` before layout preflight/rendering.
 
-## 1. Resolve and inspect the input PDF
+## 1. Inspect the source
 
-Obtain the real local path. Never invent a sandbox path from a display filename.
-
-Create a dedicated work directory:
+Resolve the real PDF path and create a work directory:
 
 ```bash
 WORKDIR=/mnt/data/<paper-stem>_layout_translation
 mkdir -p "$WORKDIR"
-```
-
-Render representative source pages first:
-
-```bash
 python scripts/render_preview.py "$INPUT_PDF" --outdir "$WORKDIR/original_preview" --pages auto --dpi 160 --contact-sheet
 ```
 
-Inspect multi-column flow, figures, equations, tables, shaded/colored backgrounds, rotated text, and whether the file has an extractable text layer.
+Inspect columns, wrap-around figures, equations, tables, figure-internal text, shaded regions, rotated text, and scan-like pages.
 
-## 2. Prepare paragraph-aware batches
-
-For Chinese:
+## 2. Reconstruct semantics and source geometry
 
 ```bash
 python scripts/prepare.py "$INPUT_PDF" --workdir "$WORKDIR" --lang-out zh-CN
 ```
 
-Add `--translate-references` only when requested.
+Add `--translate-references` only when requested. Add `--translate-figure-text` only when figure-internal labels must be translated.
 
-V2 creates:
+`prepare.py` now **does not emit translation batches**. It creates semantic units and raw geometry only. Starting translation before the next step is a workflow error.
 
-- `units.jsonl` - semantic units plus one or more original rendering regions;
-- `batches/batch_XXX.json` - compact paragraph-level translation batches;
-- `manifest.json` - page geometry and preparation report;
-- `translation_glossary.json` - reusable terminology decisions;
-- `translated/` - destination for session-generated translations.
+Outputs include:
 
-If `manifest.json` reports pages with little/no text, use a local OCR workflow first when practical. Do not claim layout-preserving translation of an image-only scan without OCR.
+- `units.jsonl` - semantic units plus source regions/line slots/exclusions;
+- `manifest.json` - page geometry and extraction status;
+- `translation_glossary.json`.
 
-## 3. Translate batches with the active session model
+## 3. Hard-gate the final writable layout before translation
 
-Read `references/translation_policy.md` once. Process batches in numeric order.
-
-For each batch:
-
-1. Read every item's `source`, `role`, `prev_tail`, `next_head`, and `hard_tokens`.
-2. Translate the entire `source` as one coherent semantic unit. **Ignore the original PDF's visual line breaks.**
-3. Use context only to resolve discourse and references; never repeat it.
-4. Keep the translation accurate, natural, and moderately concise so it can fit the original region without dropping meaning.
-5. Save exactly:
-
-```json
-{
-  "items": [
-    {"id": "u0005", "translation": "本文旨在……"}
-  ]
-}
+```bash
+python scripts/layout_preflight.py --workdir "$WORKDIR"
 ```
 
-6. Update `translation_glossary.json` for stable recurring terminology.
+This stage must finish with `status: PASS` before any batch is translated. It:
 
-Do not expose batch JSON in user-facing chat unless requested. In Work mode, continue through all batches automatically.
+- validates every translatable region against page bounds and figure exclusion zones;
+- rejects a rectangular `flow` region that crosses an image instead of discovering the collision after rendering;
+- freezes `flow` versus `slots` geometry into `units_planned.jsonl`;
+- estimates preferred/minimum CJK font sizes and safe target-language capacities;
+- adds a soft/hard layout budget to each model item;
+- writes `layout_plan.json` and only then creates `batches/batch_XXX.json`;
+- writes `layout_preflight.pdf` showing safe regions and exclusion zones.
 
-## 4. Validate translation completeness
+Render the preflight plan before translating:
+
+```bash
+python scripts/render_preview.py "$WORKDIR/layout_preflight.pdf" --outdir "$WORKDIR/layout_preflight_preview" --pages auto --dpi 130 --contact-sheet
+```
+
+Inspect the risk pages listed in `layout_plan.json`. If safe regions are wrong, fix/re-run preparation now; do not translate first and hope QA catches it later.
+
+## 4. Translate against the approved layout budget
+
+Process the generated batches in numeric order. Every item includes `layout_budget`.
+
+For each item:
+
+1. Translate the entire `source` as one coherent semantic unit.
+2. Ignore original visual line breaks.
+3. Preserve `hard_tokens` and scientific meaning.
+4. Aim for concise natural academic Chinese within `soft_cjk_chars` when possible.
+5. Treat `hard_cjk_chars` as a spatial warning, **not permission to omit meaning**. If a faithful translation needs more space, keep the meaning; the pre-render fit gate will request a compact repair before touching the PDF.
+6. Keep terminology stable in `translation_glossary.json`.
+
+Do not expose batch JSON to the user unless requested.
+
+## 5. Validate translation completeness
 
 ```bash
 python scripts/validate.py --workdir "$WORKDIR" --strict --write-merged
-```
-
-For stricter numeric/model/citation preservation checks:
-
-```bash
 python scripts/validate.py --workdir "$WORKDIR" --strict --strict-tokens --write-merged
 ```
 
-Resolve missing IDs or token warnings before final rendering.
+Resolve missing IDs and material token warnings.
 
-## 5. Apply translations without altering backgrounds
+## 6. Apply only after the pre-render fit gate passes
 
 ```bash
 python scripts/apply.py "$INPUT_PDF" --workdir "$WORKDIR" --output "$WORKDIR/<paper-stem>_translated.pdf"
 ```
 
-Important V2 behavior:
+Before opening the source PDF for mutation, `apply.py` reflows every completed translation through the already-approved regions. If any item overflows or violates an exclusion, it writes `translation_fit_report.json` / `repair_batch.json` and exits **without redacting or rendering a PDF**.
 
-- source glyphs are removed via **text-only redaction**;
-- images and vector graphics are preserved;
-- one translated paragraph can flow through several original regions/columns/pages;
-- line pitch, approximate font scale, text color, and paragraph indentation are retained;
-- a dynamically subset local CJK font is embedded, avoiding broken mixed Latin/CJK spacing and excessive file growth.
+Only when this gate passes does it:
 
-If `repair_batch.json` is generated, shorten only those translations without removing technical meaning. Save repairs to `translated/batch_repair.json`, rerun validation, then rerun `apply.py`. Do not deliver with overflow remaining.
+- remove source text with text-only redaction;
+- render regular prose inside approved `flow` regions;
+- render irregular/wrap-around prose through approved source-line `slots`;
+- adapt CJK font size/leading within bounded limits;
+- retain CJK glyph IDs during font subsetting;
+- keep collision detection as a final invariant check.
 
-`--allow-partial` is for smoke tests only, never for a final translation.
+Do not deliver when `overflow > 0` or `collision_guard_failures > 0`.
 
-## 6. Structural QA
-
-Run:
+## 7. Structural QA
 
 ```bash
 python scripts/qa.py "$INPUT_PDF" "$WORKDIR/<paper-stem>_translated.pdf" --workdir "$WORKDIR"
 ```
 
-For final delivery, failures must be zero. Investigate size-ratio warnings rather than accepting a many-times-larger PDF blindly.
+Require zero structural failures. Check page geometry, image preservation, CJK rendering, out-of-page text, source residue, and apply reports.
 
-## 7. Render every translated page and inspect visually
+## 8. Full-page visual QA
 
 ```bash
 python scripts/render_preview.py "$WORKDIR/<paper-stem>_translated.pdf" --outdir "$WORKDIR/final_preview" --pages all --dpi 130 --contact-sheet
 ```
 
-Check all of the following:
+Inspect every page for text/figure overlap, clipping, broken glyphs, column violations, preserved diagrams/equations/backgrounds, hierarchy, and visually appropriate Chinese density. Use a second renderer for complex pages when available.
 
-- paragraph translation reads continuously instead of line fragments;
-- translated text stays inside its original column/cell/caption region;
-- no clipped/overlapping text, black boxes, broken glyphs, or artificial spaces inside names such as `CatBoost`;
-- figures, equations, rules, colored cells, and page backgrounds are unchanged;
-- title/abstract/headings/captions/tables retain their visual hierarchy;
-- page count and page dimensions match the source exactly;
-- `apply_report.json` shows `overflow: 0`;
-- output file size remains reasonably close to the source unless the source itself required OCR/raster work.
+Visual QA remains mandatory, but it verifies an already-constrained layout rather than serving as the first place overlap is discovered.
 
-If a small number of complex pages fail visual QA, repair those pages/units and re-render. Do not describe a visibly damaged result as layout-preserving.
+## 9. Optional bilingual PDF
 
-## 8. Optional bilingual PDF
-
-After the monolingual translated PDF passes QA:
+After the monolingual PDF passes QA:
 
 ```bash
 python scripts/make_dual.py "$INPUT_PDF" "$WORKDIR/<paper-stem>_translated.pdf" --output "$WORKDIR/<paper-stem>_dual.pdf" --layout alternating
 ```
 
-Use `--layout side-by-side` only when requested; it changes page dimensions. Alternating mode preserves each original page size.
+Use side-by-side only when requested because it changes page dimensions.
 
-## 9. Deliver
+## 10. Regression check after Skill changes
 
-Return the translated PDF (and bilingual PDF if requested) as sandbox links. Mention only material limitations actually found during QA.
+```bash
+python scripts/self_test.py
+```
+
+Tests cover CJK subset rendering, line-slot safety, vertical fit, pre-translation layout-contract validation, and the pre-render fit gate.
 
 ## Script map
 
-- `scripts/prepare.py` - reconstruct paragraph/table/caption units and cross-region flow.
-- `scripts/validate.py` - verify IDs, completeness, and protected tokens.
-- `scripts/apply.py` - text-only redaction plus paragraph-flow rendering with dynamic CJK font subsetting.
-- `scripts/qa.py` - structural checks for geometry, overflow, source-text residue, and abnormal file growth.
-- `scripts/render_preview.py` - render pages/contact sheets for visual QA.
-- `scripts/make_dual.py` - optional alternating or side-by-side bilingual PDF.
+- `scripts/prepare.py` - reconstruct semantics and raw source geometry; does not emit translation batches.
+- `scripts/layout_preflight.py` - freeze safe writable regions, estimate CJK budgets, generate layout preview, then emit translation batches.
+- `scripts/validate.py` - verify translation completeness/protected tokens.
+- `scripts/apply.py` - pre-render fit gate followed by text-only replacement using the approved plan.
+- `scripts/qa.py` - final structural verification.
+- `scripts/render_preview.py` - source/layout/final preview rendering.
+- `scripts/make_dual.py` - optional bilingual PDF.
+- `scripts/self_test.py` - deterministic local regression tests.
 
-## Intentional model boundary
+## Model boundary
 
-The scripts cannot synchronously invoke the active ChatGPT conversation model without an API, and they must not try. The skill itself orchestrates the translation between deterministic script stages so the user's current ChatGPT/Work allowance performs the language work with zero external LLM API configuration.
+Local scripts do not call external translation services. The active ChatGPT/Work session performs linguistic translation only after deterministic layout preflight has defined the writable geometry and target-language capacity.

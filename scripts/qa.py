@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import hashlib
+from collections import Counter
 from pathlib import Path
 
 import fitz
@@ -40,6 +42,27 @@ def load_translations(wd: Path) -> dict[str, str]:
 def compact_words(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().lower()
 
+
+
+
+def image_hashes_by_page(doc: fitz.Document) -> dict[int, Counter]:
+    out: dict[int, Counter] = {}
+    for pno, page in enumerate(doc, start=1):
+        hashes = Counter()
+        for info in page.get_images(full=True):
+            xref = int(info[0])
+            try:
+                data = doc.extract_image(xref).get("image", b"")
+            except Exception:
+                data = b""
+            if data:
+                hashes[hashlib.sha256(data).hexdigest()] += 1
+        out[pno] = hashes
+    return out
+
+
+def contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff]", text))
 
 def source_probe(source: str) -> str:
     words = re.findall(r"[A-Za-z]{4,}", source)
@@ -85,6 +108,40 @@ def main() -> int:
         apply_report = json.loads(ar.read_text(encoding="utf-8"))
         if int(apply_report.get("overflow", 0)):
             failures.append(f"apply_report has {apply_report['overflow']} overflow unit(s)")
+        if int(apply_report.get("collision_guard_failures", 0)):
+            failures.append(f"apply_report has {apply_report['collision_guard_failures']} text/exclusion collision(s)")
+        if apply_report.get("layout_preflight_status") != "PASS":
+            failures.append("output was not produced from a PASSed layout preflight contract")
+        if apply_report.get("pre_render_fit_status") != "PASS":
+            failures.append("output was not produced after a PASSed pre-render fit gate")
+
+    # Source images must survive text-only redaction.  Compare extracted image bytes
+    # page by page; mismatch is a warning because some PDFs can legally re-encode an
+    # image object without changing its appearance.
+    orig_images = image_hashes_by_page(orig)
+    trans_images = image_hashes_by_page(trans)
+    image_mismatch_pages = [p for p in orig_images if orig_images[p] != trans_images.get(p, Counter())]
+    if image_mismatch_pages:
+        warnings.append(f"image object hashes/counts differ on pages {image_mismatch_pages[:20]}; inspect those pages visually")
+
+    translated_text = "\n".join(p.get_text("text") for p in trans)
+    expected_cjk = any(contains_cjk(v) for v in load_translations(wd).values())
+    if expected_cjk and not contains_cjk(translated_text):
+        failures.append("translations contain CJK but rendered PDF text layer contains no CJK; possible subset/CID glyph failure")
+
+    out_of_page = []
+    for item in apply_report.get("details", []) if apply_report else []:
+        for ib in item.get("inserted_boxes", []):
+            pno = int(ib["page"])
+            if pno < 1 or pno > len(trans):
+                out_of_page.append({"id": item.get("id"), "page": pno, "bbox": ib.get("bbox")})
+                continue
+            box = fitz.Rect(ib["bbox"])
+            page_box = trans[pno - 1].rect
+            if box.x0 < page_box.x0 - 0.5 or box.y0 < page_box.y0 - 0.5 or box.x1 > page_box.x1 + 0.5 or box.y1 > page_box.y1 + 0.5:
+                out_of_page.append({"id": item.get("id"), "page": pno, "bbox": ib.get("bbox")})
+    if out_of_page:
+        failures.append(f"{len(out_of_page)} inserted text line(s) extend outside page geometry")
 
     units_path = wd / "units.jsonl"
     residual = []
@@ -116,8 +173,26 @@ def main() -> int:
         "warnings": warnings,
         "residual_source_probes": residual[:50],
         "apply_overflow": int(apply_report.get("overflow", 0)) if apply_report else None,
+        "collision_guard_failures": int(apply_report.get("collision_guard_failures", 0)) if apply_report else None,
+        "out_of_page_insertions": out_of_page[:50],
+        "image_mismatch_pages": image_mismatch_pages,
+        "cjk_render_text_present": contains_cjk(translated_text) if expected_cjk else None,
     }
     (wd / "qa_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    run_log_path = wd / "translation_run_log.json"
+    if run_log_path.exists():
+        try:
+            run_log = json.loads(run_log_path.read_text(encoding="utf-8"))
+            run_log["qa"] = {
+                "failures": failures,
+                "warnings": warnings,
+                "page_geometry_match": not size_mismatches and len(orig) == len(trans),
+                "image_mismatch_pages": image_mismatch_pages,
+                "out_of_page_insertions": len(out_of_page),
+            }
+            run_log_path.write_text(json.dumps(run_log, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if failures or (args.strict and warnings):
         return 2

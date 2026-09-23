@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Prepare paragraph-aware translation units from a born-digital academic PDF.
 
-V2 deliberately uses the PDF content-stream order (sort=False), reconstructs prose
-paragraphs across line / block / column / page fragments, and emits one model-facing
-item per semantic unit instead of one item per visual line. Display equations and
-bibliographic references are protected by default.
+V3.1 uses PDF content-stream order (sort=False) to reconstruct semantic units and
+record source geometry, but intentionally does NOT emit translation batches. A later
+layout_preflight.py stage must validate/freeze writable target regions and target-
+language capacity before the model sees any batch.
 
 This script performs no network access and no translation.
 """
@@ -162,6 +162,96 @@ def line_color(line: dict) -> list[float]:
     # Prefer the longest span's color.
     s = max(spans, key=lambda x: len(norm_text(x.get("text", ""))))
     return color_int_to_rgb(int(s.get("color", 0)))
+
+
+def rect_area(rect: fitz.Rect) -> float:
+    return max(0.0, rect.width) * max(0.0, rect.height)
+
+
+def overlap_area(a: fitz.Rect, b: fitz.Rect) -> float:
+    r = a & b
+    return 0.0 if r.is_empty else rect_area(r)
+
+
+def collect_image_zones(page: fitz.Page) -> list[list[float]]:
+    """Return meaningful raster-image rectangles used as hard text exclusions.
+
+    Ignore tiny icons and near-full-page scans/backgrounds. Scan-like pages are handled
+    separately by the OCR warning path.
+    """
+    zones: list[fitz.Rect] = []
+    page_area = max(1.0, rect_area(page.rect))
+    for info in page.get_images(full=True):
+        xref = int(info[0])
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:
+            rects = []
+        for raw in rects:
+            r = fitz.Rect(raw) & page.rect
+            area = rect_area(r)
+            if r.is_empty or area < 120.0 or area > page_area * 0.76:
+                continue
+            if not any(overlap_area(r, old) / max(1.0, min(area, rect_area(old))) > 0.97 for old in zones):
+                zones.append(r)
+    return [[round(v, 3) for v in r] for r in zones]
+
+
+def segment_is_figure_internal(seg: dict, image_zones: list[list[float]]) -> bool:
+    """Conservatively preserve text labels that live inside a raster figure.
+
+    Captions sit outside the image and therefore remain translatable.  Requiring most
+    source-line area to be inside an image prevents ordinary wrap-around prose from
+    being mistaken for figure labels.
+    """
+    lines = seg.get("lines", [])
+    if not lines or not image_zones:
+        return False
+    total = 0.0
+    inside = 0.0
+    zones = [fitz.Rect(z) for z in image_zones]
+    for line in lines:
+        r = fitz.Rect(line["bbox"])
+        a = max(1.0, rect_area(r))
+        total += a
+        inside += max((overlap_area(r, z) for z in zones), default=0.0)
+    source = norm_text(seg.get("source", ""))
+    return inside / max(1.0, total) >= 0.72 and len(source) <= 420
+
+
+def line_slots(lines: list[dict], page_rect: fitz.Rect) -> list[list[float]]:
+    slots = []
+    for line in lines:
+        r = fitz.Rect(line["bbox"]) & page_rect
+        if not r.is_empty:
+            slots.append([round(v, 3) for v in r])
+    return slots
+
+
+def needs_line_slots(lines: list[dict], bbox: fitz.Rect, image_zones: list[list[float]], fs: float) -> bool:
+    """Use original line geometry when a paragraph is non-rectangular or wraps a figure."""
+    if len(lines) < 2:
+        return False
+    zones = [fitz.Rect(z) for z in image_zones]
+    # Strong signal: the union paragraph rectangle crosses an image, while the source
+    # lines themselves route around it.
+    if any(overlap_area(bbox, z) > max(8.0, rect_area(z) * 0.015) for z in zones):
+        line_overlap = sum(overlap_area(fitz.Rect(l["bbox"]), z) for l in lines for z in zones)
+        if line_overlap < max(12.0, rect_area(bbox) * 0.02):
+            return True
+    # Ignore first-line indentation and the naturally short final line.  Repeated edge
+    # shifts in middle lines are characteristic of wrap-around / irregular layouts.
+    middle = lines[1:-1] if len(lines) >= 4 else lines[:-1]
+    if len(middle) >= 2:
+        xs0 = [float(l["bbox"][0]) for l in middle]
+        xs1 = [float(l["bbox"][2]) for l in middle]
+        widths = [b - a for a, b in zip(xs0, xs1)]
+        maxw = max(widths) if widths else bbox.width
+        short = sum(w < maxw * 0.80 for w in widths)
+        edge_shift = max(xs0) - min(xs0) > max(11.0, fs * 1.55) or max(xs1) - min(xs1) > max(11.0, fs * 1.55)
+        if short >= 2 or edge_shift:
+            return True
+    return False
 
 
 def guess_role(page_index: int, text: str, fs: float, body_size: float, y0: float, page_h: float) -> str:
@@ -361,7 +451,7 @@ def split_prose_block(lines: list[dict], page_index: int, body_size: float, page
     return segments
 
 
-def region_from_segment(seg: dict, page_no: int, page_rect: fitz.Rect) -> dict:
+def region_from_segment(seg: dict, page_no: int, page_rect: fitz.Rect, image_zones: list[list[float]]) -> dict:
     lines = seg["lines"]
     bbox = fitz.Rect(seg["bbox"]) & page_rect
     reds = []
@@ -370,13 +460,22 @@ def region_from_segment(seg: dict, page_no: int, page_rect: fitz.Rect) -> dict:
         # Small horizontal/vertical padding removes antialiased source glyph fringes.
         r = fitz.Rect(r.x0 - 0.25, r.y0 - 0.10, r.x1 + 0.25, r.y1 + 0.10) & page_rect
         reds.append([round(v, 3) for v in r])
+    fs = float(seg.get("font_size", 8.0))
+    slot_mode = needs_line_slots(lines, bbox, image_zones, fs)
+    # A regular rectangular paragraph can be text-redacted with one annotation.
+    # Keep per-line redactions only for irregular/slot geometry; this materially
+    # reduces apply_redactions cost on complex vector-heavy pages.
+    safe_redactions = reds if slot_mode else [[round(v, 3) for v in bbox]]
     return {
         "page": page_no,
         "bbox": [round(v, 3) for v in bbox],
-        "redactions": reds,
+        "redactions": safe_redactions,
+        "line_slots": line_slots(lines, page_rect),
+        "layout_mode": "slots" if slot_mode else "flow",
+        "exclusions": image_zones,
         "line_count": max(1, len(lines)),
-        "font_size": round(float(seg.get("font_size", 8.0)), 3),
-        "line_pitch": round(float(seg.get("line_pitch", float(seg.get("font_size", 8.0)) * 1.3)), 3),
+        "font_size": round(fs, 3),
+        "line_pitch": round(float(seg.get("line_pitch", fs * 1.3)), 3),
         "color": seg.get("color", [0, 0, 0]),
         "first_indent": bool(seg.get("first_indent", False)),
         "indent_pt": round(float(seg.get("indent_pt", 0.0)), 2),
@@ -423,7 +522,7 @@ def hard_tokens(text: str) -> list[str]:
     return [x for x in tokens if not (x in seen or seen.add(x))]
 
 
-def extract_units(doc: fitz.Document, translate_references: bool) -> tuple[list[dict], list[str], float]:
+def extract_units(doc: fitz.Document, translate_references: bool, translate_figure_text: bool = False) -> tuple[list[dict], list[str], float, list[dict]]:
     body_size = median_body_size(doc)
     repeated = collect_repeated_margin_lines(doc)
     page_rects = {i + 1: [float(v) for v in page.rect] for i, page in enumerate(doc)}
@@ -431,6 +530,8 @@ def extract_units(doc: fitz.Document, translate_references: bool) -> tuple[list[
     warnings: list[str] = []
     in_references = False
     scan_like_pages = 0
+    skipped_figure_text: list[dict] = []
+    image_zones_by_page = {i + 1: collect_image_zones(page) for i, page in enumerate(doc)}
 
     for pno, page in enumerate(doc):
         data = page.get_text("dict", sort=False)
@@ -487,7 +588,15 @@ def extract_units(doc: fitz.Document, translate_references: bool) -> tuple[list[
                     continue
                 if src.lower().rstrip(":") in REF_HEADINGS:
                     seg["role"] = "heading"
-                reg = region_from_segment(seg, pno + 1, page.rect)
+                page_zones = image_zones_by_page.get(pno + 1, [])
+                if not translate_figure_text and segment_is_figure_internal(seg, page_zones):
+                    skipped_figure_text.append({
+                        "page": pno + 1,
+                        "source": src[:240],
+                        "bbox": [round(v, 3) for v in fitz.Rect(seg["bbox"])],
+                    })
+                    continue
+                reg = region_from_segment(seg, pno + 1, page.rect, page_zones)
                 candidates.append({
                     "page": pno + 1,
                     "block": bidx,
@@ -527,7 +636,9 @@ def extract_units(doc: fitz.Document, translate_references: bool) -> tuple[list[
 
     if scan_like_pages:
         warnings.append(f"{scan_like_pages} page(s) contain very little extractable text; OCR may be required.")
-    return units, warnings, body_size
+    if skipped_figure_text:
+        warnings.append(f"Preserved {len(skipped_figure_text)} figure-internal text segment(s) in the source language; use --translate-figure-text to override.")
+    return units, warnings, body_size, skipped_figure_text
 
 
 def write_batches(units: list[dict], workdir: Path, lang_in: str, lang_out: str, max_chars: int) -> list[str]:
@@ -578,6 +689,7 @@ def main() -> int:
     ap.add_argument("--lang-out", default="zh-CN")
     ap.add_argument("--max-batch-chars", type=int, default=6500)
     ap.add_argument("--translate-references", action="store_true")
+    ap.add_argument("--translate-figure-text", action="store_true", help="Translate text embedded inside raster figure regions. Default preserves it to avoid graphic-label collisions.")
     args = ap.parse_args()
 
     pdf = Path(args.input_pdf).resolve()
@@ -585,22 +697,38 @@ def main() -> int:
     wd.mkdir(parents=True, exist_ok=True)
     (wd / "translated").mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf)
-    units, warnings, body_size = extract_units(doc, args.translate_references)
+    units, warnings, body_size, skipped_figure_text = extract_units(doc, args.translate_references, args.translate_figure_text)
     with (wd / "units.jsonl").open("w", encoding="utf-8") as f:
         for u in units:
             f.write(json.dumps(u, ensure_ascii=False) + "\n")
-    batch_names = write_batches(units, wd, args.lang_in, args.lang_out, args.max_batch_chars)
+    # V3.1: translation batches are intentionally NOT emitted here.
+    # A separate layout_preflight.py stage must first validate safe geometry and
+    # compute target-language capacity budgets. This prevents translation from
+    # starting before the final writable regions are known.
+    batchdir = wd / "batches"
+    batchdir.mkdir(parents=True, exist_ok=True)
+    for old in batchdir.glob("batch_*.json"):
+        old.unlink()
+    batch_names = []
     manifest = {
-        "engine_version": 2,
+        "engine_version": 3.1,
         "input_pdf": str(pdf),
         "page_count": len(doc),
         "page_sizes": [[round(float(p.rect.width), 3), round(float(p.rect.height), 3)] for p in doc],
         "body_font_size": round(body_size, 3),
         "translation_units": len(units),
         "batches": batch_names,
+        "layout_preflight_required": True,
+        "layout_preflight_status": "PENDING",
         "source_language": args.lang_in,
         "target_language": args.lang_out,
         "translate_references": bool(args.translate_references),
+        "translate_figure_text": bool(args.translate_figure_text),
+        "figure_internal_skipped": skipped_figure_text,
+        "layout_modes": {
+            "slots": sum(1 for u in units for r in u.get("regions", []) if r.get("layout_mode") == "slots"),
+            "flow": sum(1 for u in units for r in u.get("regions", []) if r.get("layout_mode") != "slots"),
+        },
         "warnings": warnings,
     }
     (wd / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -608,6 +736,7 @@ def main() -> int:
     if not gloss.exists():
         gloss.write_text(json.dumps({"terms": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
+    print("NEXT: run scripts/layout_preflight.py --workdir <WORKDIR> before translating any batch.")
     return 0
 
 
