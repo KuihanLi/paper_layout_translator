@@ -1,58 +1,73 @@
-# Architecture and rationale - V2
+# Architecture and rationale - V3.1
 
-## Why V1 did not match PDF2zh/BabelDOC quality
-The first implementation treated visual PDF lines / span groups as translation units and then painted white rectangles over those boxes. That architecture has three predictable failure modes:
+## Why V3 still needed a workflow change
 
-1. **Line-fragment translation** - a semantic paragraph becomes many unrelated model calls, so citations, hyphenated words, discourse order, and cross-column continuation break.
-2. **Box-by-box typesetting** - Chinese is forced into the dimensions of individual English lines, producing tiny type, uneven whitespace, and unnatural wrapping.
-3. **Background destruction** - opaque white cover rectangles assume a white page and can visibly damage colored cells, shaded areas, rules, or other page artwork. Repeated multilingual HTML fallback can also inflate the PDF substantially.
+V3 fixed the main geometry mechanics: wrap-around paragraphs could use source-line slots, image zones were protected, CJK density was adapted, and font glyph IDs were retained. However, the user-facing workflow could still behave as if layout correctness were mainly established after translation and rendering: a translation was produced, inserted, and then QA confirmed whether it overlapped.
 
-V2 replaces that architecture rather than merely tuning font sizes.
+That order wastes work and makes collision handling feel reactive even when the renderer has safety guards.
 
-## Upstream design lesson
-`zotero-pdf2zh` delegates the difficult layout work to `pdf2zh_next` / BabelDOC. PDFMathTranslate-next identifies itself as BabelDOC-based and emphasizes preserving formulas, charts, tables of contents, and annotations. BabelDOC's translator documentation describes paragraph processing and formula/rich-text placeholders before translation. The upstream PDFMathTranslate documentation also highlights cross-column/cross-page semantic consistency and dynamic scaling in the newer engine.
+## V3.1 principle: freeze layout before language generation
 
-V2 follows those **design principles** without bundling or copying the upstream AGPL implementation:
+V3.1 separates the pipeline into three contracts:
 
-- semantic paragraphs before translation;
-- protected display math;
-- logical content-stream order for multi-column papers;
-- cross-block / cross-column / cross-page paragraph flow when geometry indicates continuation;
-- layout-specific handling for table cells and captions;
-- rendering back into the original regions only after translation.
+1. **semantic contract** - what text belongs together and in what reading order;
+2. **layout contract** - exactly where target text may be written and how much target-language capacity exists;
+3. **linguistic contract** - accurate paragraph translation constrained by the already-approved layout budget.
 
-## Session-native model boundary
-A local Python script cannot consume the current ChatGPT subscription/session model without an API call. Therefore the skill intentionally separates deterministic PDF work from linguistic work:
+Translation starts only after the layout contract passes.
 
-1. `prepare.py`: local parsing only; output paragraph-level JSON batches.
-2. Active ChatGPT / Work model: translate batches directly using the current session allowance.
-3. `validate.py`: check IDs, completeness, and protected tokens.
-4. `apply.py`: text-only PDF redaction + translated paragraph flow.
-5. `qa.py` + rendered previews: structural and visual verification.
+## Stage A - semantic/source geometry extraction
 
-No bundled script sends text to OpenAI, DeepSeek, Google, Microsoft, SiliconFlow, or another translation endpoint.
+`prepare.py` reconstructs paragraphs, captions, headings and table cells while recording source line geometry, image exclusions, font scale and semantic context. It deliberately emits no translation batches.
 
-## Background-preserving replacement
-V2 no longer paints a guessed background color. It adds redaction annotations over source glyph boxes and applies redactions with **text removal only** (`images=0`, `graphics=0`, `text=0` in PyMuPDF). Images, vector lines, fills, charts, and page backgrounds therefore remain in the original PDF content.
+## Stage B - pre-translation layout preflight
 
-This is materially closer to "do not change the paper layout" than painting white rectangles over text.
+`layout_preflight.py` is the new hard gate. It:
 
-## Paragraph-flow rendering
-A unit can have multiple `regions`. For example, a paragraph may start at the bottom of the left column and continue near the top of the right column. The model produces one coherent Chinese translation; the renderer then wraps that single translation sequentially through the original regions while retaining each region's width, line count, approximate font size, line pitch, color, and first-line indentation.
+- validates all bboxes against page geometry;
+- rejects rectangular flow boxes that cross protected images;
+- validates slot geometry against exclusions;
+- freezes the final plan into `units_planned.jsonl`;
+- estimates CJK capacity at preferred/minimum font sizes;
+- produces `layout_plan.json` and an annotated `layout_preflight.pdf`;
+- creates translation batches only when the plan is `PASS`.
 
-Tables are intentionally different: cells/labels remain separate units because collapsing a table into prose would destroy its structure.
+This turns figure avoidance from a post-render repair into a pre-translation invariant.
 
-## Font strategy
-V2 does not bundle font files. At render time it locates a CJK font already installed in the runtime, dynamically subsets it to the characters actually needed, and embeds only that small subset into the output PDF. This gives natural mixed Chinese/Latin text such as `CatBoost 与 XGBoost` while avoiding the tens-of-megabytes blow-up caused by repeatedly embedding fallback fonts.
+## Stage C - layout-aware translation
+
+Each batch item contains a compact `layout_budget`: comfortable CJK character capacity, hard spatial warning, preferred/minimum target font sizes, and risk class. The active ChatGPT/Work model can therefore choose concise natural Chinese on the first pass without seeing or manipulating raw PDF coordinates.
+
+The budget is advisory for wording, not a license to truncate scientific content.
+
+## Stage D - pre-render fit gate
+
+Before redacting the source PDF, `apply.py` flows every finished translation through the frozen plan using the real target font metrics. If any paragraph cannot fit or hits an exclusion, the script writes a repair batch and exits without mutating/rendering the PDF.
+
+Only a fully fitting translation set reaches the redaction/render stage.
+
+## Rendering and final QA
+
+Rendering keeps the V3 behavior: text-only redaction, flow/slot insertion, bounded CJK typography, retained glyph IDs and invariant collision checks. `qa.py` and full-page previews remain mandatory because PDF rendering is complex, but they are now confirmation stages rather than the normal first detection of geometric conflicts.
+
+## Figure-label policy
+
+Raster figure-internal labels remain untouched by default. They are outside the body-text layout contract and require an explicit figure-label translation path when requested.
+
+## Model boundary
+
+No local script invokes an external translation API. Deterministic scripts establish and enforce geometry; the active ChatGPT/Work session performs linguistic translation after the layout contract is approved.
 
 ## Current limits
-- Best on born-digital PDFs with extractable text. Image-only scans still require OCR first.
-- Rasterized text inside figures is intentionally left unchanged unless the user requests image translation.
-- Very complex magazines, arbitrary rotated text, unusual vertical writing, and deeply nested vector tables can still require page-specific repair.
-- Exact proprietary source font identity is not guaranteed; V2 preserves geometry and typographic scale while using an installed CJK-compatible serif/sans font.
-- The local fallback engine is independent and lighter than BabelDOC. If the runtime already provides an upstream layout engine, it may be used only when doing so does not require a third-party translation API; the active ChatGPT session remains the translator.
 
-## Upstream references
+- Best on born-digital PDFs with extractable text; scans require OCR.
+- Pure-vector diagrams without a raster bounding image can still require conservative slot segmentation and visual inspection.
+- A capacity budget is an estimate; the exact pre-render fit gate is authoritative.
+- Highly irregular editorial/magazine layouts may require page-specific repair.
+- Exact proprietary source fonts are not guaranteed.
+
+## Upstream design references
+
 - Zotero integration: https://github.com/guaguastandup/zotero-pdf2zh
 - PDFMathTranslate Next: https://github.com/PDFMathTranslate/PDFMathTranslate-next
 - BabelDOC translator implementation notes: https://github.com/funstory-ai/BabelDOC/blob/main/docs/ImplementationDetails/ILTranslator/ILTranslator.md
